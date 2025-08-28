@@ -1,0 +1,13 @@
+# OCR (usando el nuevo SDK)
+azure-ai-documentintelligence==1.0.0b4
+azure-core>=1.30.0
+
+# Utilidades
+python-dotenv>=1.0.1
+pandas>=2.2.0
+pydantic>=2.7.0
+
+# Mini UI
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+python-multipart==0.0.9
