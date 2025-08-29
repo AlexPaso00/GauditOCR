@@ -1,24 +1,28 @@
+from __future__ import annotations
+
 from pydantic import BaseModel, Field
-from typing import List, Optional
+from typing import List, Optional, Any
 import re
 
-# IGI constants (Andorra)
+# --- IGI helpers (los usa normalize para completar impuestos por línea) ---
 IGI_RATES = [0.0, 1.0, 2.5, 4.5, 9.5]
-
-NRT_REGEX = re.compile(r"\b([AELF])[-\s]?(\d{6})[-\s]?([A-Z])\b", re.IGNORECASE)
 
 def normalize_igi_rate(rate: Optional[float]) -> Optional[float]:
     if rate is None:
         return None
-    # snap to closest official IGI rate (0, 1, 2.5, 4.5, 9.5)
     return min(IGI_RATES, key=lambda x: abs(x - round(float(rate), 2)))
 
 def igi_code_from_rate(rate: Optional[float]) -> Optional[str]:
     r = normalize_igi_rate(rate)
     if r is None:
         return None
-    txt = str(r).replace('.', '_')
-    return f"IGI_{txt}"
+    return f"IGI_{str(r).replace('.', '_')}"
+
+# --- NRT/NIF/CIF detection (Andorra + España) ---
+RE_NRT_AND = re.compile(r"\b([AELF])[-\s]?(\d{6})[-\s]?([A-Z])\b", re.IGNORECASE)
+RE_NIF_ES  = re.compile(r"\b(\d{8})([A-Z])\b", re.IGNORECASE)  # DNI
+RE_NIE_ES  = re.compile(r"\b([XYZ])(\d{7})([A-Z])\b", re.IGNORECASE)
+RE_CIF_ES  = re.compile(r"\b([ABCDEFGHJKLMNPQRSUVW])(\d{7})([0-9A-J])\b", re.IGNORECASE)
 
 class Linea(BaseModel):
     descripcion: Optional[str] = None
@@ -35,13 +39,13 @@ class FacturaNormalizada(BaseModel):
     proveedor_nombre: Optional[str] = None
     proveedor_nrt: Optional[str] = None
     proveedor_direccion: Optional[str] = None
-    proveedor_razon_social: Optional[str] = None   # VendorAddressRecipient
+    proveedor_razon_social: Optional[str] = None
 
     # CLIENTE
     cliente_nombre: Optional[str] = None
     cliente_nrt: Optional[str] = None
     cliente_direccion: Optional[str] = None
-    cliente_razon_social: Optional[str] = None     # CustomerAddressRecipient
+    cliente_razon_social: Optional[str] = None
 
     # FACTURA
     num_factura: Optional[str] = None
@@ -57,14 +61,36 @@ class FacturaNormalizada(BaseModel):
 
     # LÍNEAS Y CLASIFICACIÓN
     lineas: List[Linea] = Field(default_factory=list)
-    clasificacion_sage: Optional[str] = None  # centro de coste / categoría
-    codigo_igi_sage: Optional[str] = None     # si homogéneo
+    clasificacion_sage: Optional[str] = None
+    codigo_igi_sage: Optional[str] = None
+
+    # --- Espejo Azure (modo raw) ---
+    azure_fields: dict[str, Any] = Field(default_factory=dict)
+    azure_items: List[dict] = Field(default_factory=list)
+    azure_kv_pairs: List[dict] = Field(default_factory=list)
+    azure_tables: List[List[List[str]]] = Field(default_factory=list)
 
     @staticmethod
     def try_extract_nrt(text: Optional[str]) -> Optional[str]:
+        """Devuelve NRT (Andorra) o NIF/NIE/CIF (España) si lo detecta."""
         if not text:
             return None
-        m = NRT_REGEX.search(text.upper())
+        t = str(text).upper()
+
+        m = RE_NRT_AND.search(t)
         if m:
-            return f"{m.group(1).upper()}-{m.group(2)}-{m.group(3).upper()}"
+            return f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+
+        m = RE_CIF_ES.search(t)
+        if m:
+            return f"{m.group(1)}{m.group(2)}{m.group(3)}"
+
+        m = RE_NIE_ES.search(t)
+        if m:
+            return f"{m.group(1)}{m.group(2)}{m.group(3)}"
+
+        m = RE_NIF_ES.search(t)
+        if m:
+            return f"{m.group(1)}{m.group(2)}"
+
         return None

@@ -2,23 +2,24 @@ import os
 import uuid
 import datetime as dt
 from pathlib import Path
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse
 from dotenv import load_dotenv
 
+# --------------------------
+# Paths y entorno
+# --------------------------
 ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = ROOT / "data"
 INPUT_DIR = DATA_DIR / "input"
 OUTPUT_DIR = DATA_DIR / "output"
-
 INPUT_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
 load_dotenv(dotenv_path=ROOT / ".env")
 
-# Importa adaptadores de tu pipeline
+# Pipeline
 from .main import process_invoice, save_output_json  # type: ignore
 
 app = FastAPI(title="GauditOCR – Demo UI SAGE Mock")
@@ -43,6 +44,27 @@ def read_json(path: Path) -> Dict[str, Any]:
     import json as _json
     return _json.loads(path.read_text(encoding="utf-8"))
 
+def _html_table_from_items(items: List[Dict[str, Any]]) -> str:
+    """Tabla dinámica para azure_items (columnas = unión de keys)."""
+    cols: List[str] = []
+    for it in items:
+        for k in it.keys():
+            if k not in cols:
+                cols.append(k)
+    if not cols:
+        return "<div class='muted'>Sin columnas</div>"
+
+    header = "".join(f"<th>{c}</th>" for c in cols)
+    rows = "".join(
+        "<tr>" + "".join(f"<td>{(it.get(c, '') or '')}</td>" for c in cols) + "</tr>"
+        for it in items
+    )
+    return f"<table><thead><tr>{header}</tr></thead><tbody>{rows}</tbody></table>"
+
+def _html_table_from_grid(grid: List[List[str]]) -> str:
+    rows = "".join("<tr>" + "".join(f"<td>{c}</td>" for c in row) + "</tr>" for row in grid)
+    return f"<table><tbody>{rows}</tbody></table>"
+
 
 # --------------------------
 # Vistas
@@ -53,13 +75,12 @@ def home():
     for p in sorted(OUTPUT_DIR.glob("*.json"), key=lambda x: x.stat().st_mtime, reverse=True):
         name = p.stem
         if name.endswith(".post"):
-            # omitimos los post.json en la lista principal
             continue
         ts = dt.datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M:%S")
         post_path = OUTPUT_DIR / f"{name}.post.json"
-        posted_badge = "<span style='background:#e5e7eb;padding:2px 8px;border-radius:999px;'>Pendiente</span>"
+        posted_badge = "<span class='badge grey'>Pendiente</span>"
         if post_path.exists():
-            posted_badge = "<span style='background:#DCFCE7;padding:2px 8px;border-radius:999px;'>Completado</span>"
+            posted_badge = "<span class='badge green'>Completado</span>"
         rows.append(
             f"<tr>"
             f"<td>{name}</td>"
@@ -87,6 +108,9 @@ def home():
           button:hover {{ opacity:0.9; }}
           input[type=file] {{ padding:6px; }}
           .muted {{ color:#6b7280; font-size:12px; }}
+          .badge {{ padding:2px 8px; border-radius:999px; font-size:12px; }}
+          .badge.grey {{ background:#e5e7eb; }}
+          .badge.green {{ background:#22c55e; color:white; }}
         </style>
       </head>
       <body>
@@ -117,30 +141,19 @@ def home():
 
 @app.post("/upload-and-process")
 async def upload_and_process(file: UploadFile = File(...), tenant: Optional[str] = Form(None)):
-    """
-    - Guarda archivo en data/input/{uuid}.ext
-    - Ejecuta pipeline (process_invoice) -> data/output/{uuid}.json
-    - Postea mock a SAGE -> data/output/{uuid}.post.json
-    - Redirige al comprobante (RedirectResponse 303)
-    """
     ext = Path(file.filename).suffix.lower() if file.filename else ".pdf"
     doc_id = str(uuid.uuid4())
     input_path = INPUT_DIR / f"{doc_id}{ext}"
     with input_path.open("wb") as f:
         f.write(await file.read())
 
-    # 1) Procesar con tu pipeline
     payload = process_invoice(str(input_path))
-
-    # 2) Guardar JSON de salida
     out_json_path = OUTPUT_DIR / f"{doc_id}.json"
     save_output_json(payload, str(out_json_path))
 
-    # 3) Postear (mock) y guardar comprobante de posteo
     post_res = post_to_sage_mock(payload)
     save_output_json(post_res, str(OUTPUT_DIR / f"{doc_id}.post.json"))
 
-    # 4) Redirigir al comprobante
     return RedirectResponse(url=f"/receipt/{doc_id}", status_code=303)
 
 
@@ -149,15 +162,18 @@ def get_json(name: str):
     p = OUTPUT_DIR / name
     if not p.exists():
         return JSONResponse({"ok": False, "error": "No existe"}, status_code=404)
-    # Opción 1: devolver dict (JSON real, sin comillas escapadas)
-    data = read_json(p)  # parsea archivo a dict
+    data = read_json(p)
     return JSONResponse(content=data)
 
 
 @app.get("/receipt/{doc_id}", response_class=HTMLResponse)
 def receipt(doc_id: str):
     """
-    Render de comprobante "registrado en SAGE (mock)" con estilo simple.
+    Vista ÚNICA: Azure (raw). Muestra exactamente lo devuelto por Document Intelligence:
+    - azure_items (tabla dinámica)
+    - azure_tables (rejillas)
+    - azure_fields (key->value)
+    - azure_kv_pairs (pares clave-valor)
     """
     json_path = OUTPUT_DIR / f"{doc_id}.json"
     post_path = OUTPUT_DIR / f"{doc_id}.post.json"
@@ -167,39 +183,51 @@ def receipt(doc_id: str):
     data = read_json(json_path)
     post = read_json(post_path)
 
-    proveedor = data.get("proveedor_nombre") or data.get("proveedor", {}).get("nombre")
-    proveedor_nrt = data.get("proveedor_nrt") or data.get("proveedor", {}).get("nrt")
-    cliente = data.get("cliente_nombre") or data.get("cliente", {}).get("nombre")
-    cliente_nrt = data.get("cliente_nrt") or data.get("cliente", {}).get("nrt")
-    num_factura = data.get("num_factura") or data.get("factura", {}).get("numero")
-    fecha = data.get("fecha") or data.get("factura", {}).get("fecha_emision")
-    moneda = data.get("moneda") or data.get("factura", {}).get("moneda") or "EUR"
-    base = data.get("base_imponible") or data.get("totales", {}).get("base_imponible")
-    impuesto = data.get("igi") or data.get("totales", {}).get("impuesto")
-    total = data.get("total") or data.get("totales", {}).get("total")
-    lineas = data.get("lineas") or []
+    # Azure raw
+    azure_items  = data.get("azure_items") or []
+    azure_tables = data.get("azure_tables") or []
+    azure_fields = data.get("azure_fields") or {}
+    azure_kv     = data.get("azure_kv_pairs") or []
+
+    # Mini-resumen sacado directamente de azure_fields (sin normalizar)
+    vendor   = azure_fields.get("VendorName") or "-"
+    customer = azure_fields.get("CustomerName") or "-"
+    inv_id   = azure_fields.get("InvoiceId") or "-"
+    inv_date = azure_fields.get("InvoiceDate") or "-"
+    subtotal = azure_fields.get("SubTotal") or "-"
+    tax      = azure_fields.get("TotalTax") or "-"
+    total    = azure_fields.get("InvoiceTotal") or "-"
+    curr     = azure_fields.get("CurrencyCode") or "—"
 
     tx_id = post.get("sage_tx_id")
     posted_at = post.get("posted_at")
 
-    # Render
+    items_html = _html_table_from_items(azure_items) if azure_items else "<div class='muted'>Sin items</div>"
+    tables_html = "".join(
+        f"<div class='muted'>Tabla {i+1}</div>{_html_table_from_grid(tab)}"
+        for i, tab in enumerate(azure_tables)
+    ) if azure_tables else "<div class='muted'>Sin tablas</div>"
+
+    fields_rows = "".join(f"<tr><td>{k}</td><td>{v}</td></tr>" for k, v in azure_fields.items()) or "<tr><td colspan='2' class='muted'>Sin fields</td></tr>"
+    kv_rows = "".join(f"<tr><td>{kv.get('key','')}</td><td>{kv.get('value','')}</td></tr>" for kv in azure_kv) or "<tr><td colspan='2' class='muted'>Sin pares clave-valor</td></tr>"
+
     html = f"""
     <html>
       <head>
         <meta charset="utf-8" />
-        <title>Comprobante SAGE (mock)</title>
+        <title>Azure raw · Comprobante (mock)</title>
         <style>
           body {{ font-family: Arial, sans-serif; padding: 28px; color:#111827; background:#fafafa; }}
-          .card {{ background:white; border:1px solid #e5e7eb; border-radius:14px; padding:20px; max-width: 980px; margin: 0 auto; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }}
+          .card {{ background:white; border:1px solid #e5e7eb; border-radius:14px; padding:20px; max-width: 1100px; margin: 0 auto; box-shadow: 0 1px 2px rgba(0,0,0,0.04); }}
           .header {{ display:flex; align-items:center; justify-content:space-between; margin-bottom:12px; }}
           .badge-ok {{ background:#22c55e; color:white; padding:6px 10px; border-radius:999px; font-weight:600; }}
           .muted {{ color:#6b7280; font-size:12px; }}
-          .grid {{ display:grid; grid-template-columns: 1fr 1fr; gap:14px; }}
+          .grid {{ display:grid; grid-template-columns: repeat(4, 1fr); gap:12px; }}
+          .kpi {{ background:#f9fafb; border:1px solid #e5e7eb; border-radius:10px; padding:10px; }}
+          .kpi .label {{ font-size:12px; color:#6b7280; }}
           table {{ width:100%; border-collapse: collapse; margin-top: 12px; }}
-          th, td {{ border-bottom:1px solid #f3f4f6; padding:10px; text-align:left; }}
+          th, td {{ border-bottom:1px solid #f3f4f6; padding:10px; text-align:left; vertical-align: top; }}
           th {{ background:#f9fafb; }}
-          .totals {{ text-align:right; margin-top: 14px; }}
-          .totals div {{ margin: 4px 0; }}
           .actions {{ margin-top:20px; display:flex; gap:10px; }}
           a.btn {{ text-decoration:none; display:inline-block; padding:10px 14px; border-radius:8px; }}
           .btn-dark {{ background:#111827; color:white; }}
@@ -211,61 +239,34 @@ def receipt(doc_id: str):
         <div class="card">
           <div class="header">
             <div>
-              <h2 style="margin:0;">Factura registrada en SAGE (mock)</h2>
+              <h2 style="margin:0;">Documento procesado · Vista Azure (raw)</h2>
               <div class="muted">Transacción <code>{tx_id}</code> · {posted_at}</div>
             </div>
             <span class="badge-ok">Completado</span>
           </div>
 
           <div class="grid">
-            <div>
-              <h4 style="margin:0 0 6px 0;">Proveedor</h4>
-              <div><strong>{proveedor or '-'}</strong></div>
-              <div class="muted">{proveedor_nrt or '-'}</div>
-            </div>
-            <div>
-              <h4 style="margin:0 0 6px 0;">Cliente</h4>
-              <div><strong>{cliente or '-'}</strong></div>
-              <div class="muted">{cliente_nrt or '-'}</div>
-            </div>
+            <div class="kpi"><div class="label">Proveedor</div><div><strong>{vendor}</strong></div></div>
+            <div class="kpi"><div class="label">Cliente</div><div><strong>{customer}</strong></div></div>
+            <div class="kpi"><div class="label">Nº factura</div><div><strong>{inv_id}</strong></div></div>
+            <div class="kpi"><div class="label">Fecha</div><div><strong>{inv_date}</strong></div></div>
+            <div class="kpi"><div class="label">Subtotal</div><div><strong>{subtotal}</strong></div></div>
+            <div class="kpi"><div class="label">Impuestos</div><div><strong>{tax}</strong></div></div>
+            <div class="kpi"><div class="label">Total</div><div><strong>{total}</strong></div></div>
+            <div class="kpi"><div class="label">Moneda</div><div><strong>{curr}</strong></div></div>
           </div>
 
-          <div class="grid" style="margin-top:12px;">
-            <div>
-              <div class="muted">Número de factura</div>
-              <div><strong>{num_factura or '-'}</strong></div>
-            </div>
-            <div>
-              <div class="muted">Fecha</div>
-              <div><strong>{fecha or '-'}</strong></div>
-            </div>
-          </div>
+          <h3 style="margin-top:18px;">Items</h3>
+          {items_html}
 
-          <table>
-            <thead>
-              <tr>
-                <th>Descripción</th>
-                <th style="width:100px;">Cantidad</th>
-                <th style="width:140px;">Precio</th>
-                <th style="width:140px;">Importe</th>
-              </tr>
-            </thead>
-            <tbody>
-              {''.join([
-                f"<tr><td>{(l.get('descripcion') or '')}</td>"
-                f"<td>{(l.get('cantidad') or '')}</td>"
-                f"<td>{(l.get('precio_unitario') or '')}</td>"
-                f"<td>{(l.get('total_linea') or '')}</td></tr>"
-                for l in lineas
-              ]) or '<tr><td colspan="4" class="muted">Sin líneas</td></tr>'}
-            </tbody>
-          </table>
+          <h3 style="margin-top:18px;">Tablas</h3>
+          {tables_html}
 
-          <div class="totals">
-            <div>Base imponible: <strong>{base if base is not None else '-'}</strong> {moneda}</div>
-            <div>Impuestos: <strong>{impuesto if impuesto is not None else '-'}</strong> {moneda}</div>
-            <div style="font-size:18px;">Total: <strong>{total if total is not None else '-'}</strong> {moneda}</div>
-          </div>
+          <h3 style="margin-top:18px;">Fields</h3>
+          <table><tbody>{fields_rows}</tbody></table>
+
+          <h3 style="margin-top:18px;">Key-Value pairs</h3>
+          <table><tbody>{kv_rows}</tbody></table>
 
           <div class="actions">
             <a class="btn btn-dark" href="/json/{doc_id}.json" target="_blank">Ver JSON</a>
